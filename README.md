@@ -130,14 +130,26 @@ Then run any speed test and compare against a single line.
 
 ## Proof it works
 
-Real result from a 5-line home setup through this tunnel — Ookla Speedtest
-on a home PC, with per-line traffic (`eth0/eth1/eth2…`) visible on the
-dashboard underneath:
+Real result from a home with **4 ISPs bonded** through this tunnel — Ookla
+Speedtest on a home PC, with per-line traffic (`eth0/eth1/eth2…`) visible on
+the dashboard underneath:
 
 ![Speedtest through the bonded tunnel: 6 ms ping, 5304.98 Mbps down, 2926.46 Mbps up](IMG_3342.JPG)
 
-**6 ms ping, 5.3 Gbps down, 2.9 Gbps up** — no single home line here could do
-that alone. Your numbers will match roughly the sum of *your* lines.
+The 4 lines going in:
+
+| | Download | Upload |
+|---|---|---|
+| ISP 1 | 2000 Mbps | 1000 Mbps |
+| ISP 2 | 2000 Mbps | 1000 Mbps |
+| ISP 3 | 1000 Mbps | 500 Mbps |
+| ISP 4 | 500 Mbps | 500 Mbps |
+| **Total** | **5500 Mbps** | **3000 Mbps** |
+
+Measured through the tunnel: **5305 down / 2926 up** — that's ~96% of the
+combined download and ~98% of the combined upload surviving encryption and
+reassembly, at 6 ms ping. No single line here could do even half of that
+alone. Your numbers will match roughly the sum of *your* lines.
 
 ## If something's wrong
 
