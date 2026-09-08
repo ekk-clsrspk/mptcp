@@ -18,8 +18,10 @@ set -euo pipefail
 # ─────────────────────────── Configuration ──────────────────────────────────
 SS_PORT=8389                          # Different port from sing-box (8388)
 SS_METHOD="2022-blake3-aes-128-gcm"
-VPS_INTERFACE="enX0"
-MPTCP_SUBFLOW_LIMIT=24
+# Auto-detect default interface (override: VPS_INTERFACE=eth0 sudo bash vps-ss.sh)
+VPS_INTERFACE="${VPS_INTERFACE:-$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')}"
+# Kernel 6.8 MPTCP_SUBFLOWS_MAX = 8 — values above 8 fail
+MPTCP_SUBFLOW_LIMIT=8
 # ────────────────────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -39,6 +41,10 @@ fi
 
 banner "MPTCP VPS Deployment (shadowsocks-rust)"
 log "Kernel: $(uname -r)"
+if [[ -z "${VPS_INTERFACE:-}" ]]; then
+    err "Cannot detect default interface. Re-run with: VPS_INTERFACE=eth0 sudo bash vps-ss.sh"
+    exit 1
+fi
 log "Interface: ${VPS_INTERFACE}"
 log "Port: ${SS_PORT}"
 
@@ -46,8 +52,8 @@ log "Port: ${SS_PORT}"
 # 1. System packages
 ###############################################################################
 banner "Step 1/6 — System Update & Packages"
-#apt-get update -qq
-#apt-get install -y -qq iproute2 curl wget jq iperf3 openssl iptables xz-utils > /dev/null 2>&1
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iproute2 curl wget jq iperf3 openssl iptables xz-utils ethtool sysstat ipset > /dev/null 2>&1
 log "System packages installed"
 
 ###############################################################################
@@ -59,14 +65,14 @@ cat > /etc/sysctl.d/90-mptcp.conf << 'EOF'
 net.mptcp.enabled=1
 net.ipv4.ip_forward=1
 
-# ── TCP Buffers (MPTCP aggregation) ──
-net.core.rmem_max=268435456
-net.core.wmem_max=268435456
+# ── TCP Buffers (BDP-sized: 64M covers ~5Gbps @ 100ms; 256M wastes RAM on 4GB VPS) ──
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
 net.core.rmem_default=1048576
 net.core.wmem_default=1048576
-net.ipv4.tcp_rmem=4096 1048576 134217728
-net.ipv4.tcp_wmem=4096 1048576 134217728
-net.ipv4.tcp_mem=786432 1048576 1572864
+net.ipv4.tcp_rmem=4096 1048576 67108864
+net.ipv4.tcp_wmem=4096 1048576 67108864
+net.ipv4.tcp_mem=262144 349525 524288
 
 # ── Backlog & Connection Handling ──
 net.core.netdev_max_backlog=50000
@@ -79,9 +85,20 @@ net.core.default_qdisc=fq
 net.core.netdev_budget=600
 net.core.netdev_budget_usecs=8000
 
-# Busy polling — reduce context switches for high-throughput
-net.core.busy_read=50
-net.core.busy_poll=50
+# Busy polling 10 = ~90% of the latency gain of 50 at ~1/5 the CPU burn (matters on vCPU + steal)
+net.core.busy_read=10
+net.core.busy_poll=10
+
+# ── Conntrack tuning (was missing: unbounded growth + 5-day default timeout) ──
+net.netfilter.nf_conntrack_max=262144
+net.netfilter.nf_conntrack_tcp_timeout_established=600
+net.netfilter.nf_conntrack_buckets=65536
+
+# ── Reuse routes quickly (many short SS flows) ──
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_fastopen=3
 
 # ── Tolerate MPTCP reordering ──
 net.ipv4.tcp_reordering=127
@@ -91,12 +108,18 @@ net.ipv4.tcp_timestamps=0
 EOF
 
 sysctl -p /etc/sysctl.d/90-mptcp.conf > /dev/null 2>&1
+# Cap at kernel max (MPTCP_SUBFLOWS_MAX=8 on 6.8); higher values error out
+if (( MPTCP_SUBFLOW_LIMIT > 8 )); then MPTCP_SUBFLOW_LIMIT=8; fi
 ip mptcp limits set subflow ${MPTCP_SUBFLOW_LIMIT} add_addr_accepted ${MPTCP_SUBFLOW_LIMIT}
-log "MPTCP enabled, large buffers, BBR, reordering tolerance"
+log "MPTCP enabled, BDP buffers, BBR, reordering tolerance"
 
-# ── NIC offloads & RPS/RFS (spread softirq across all cores) ──
+# ── NIC offloads + rings + coalescing (fewer, bigger interrupts) ──
 NUM_CPUS=$(nproc)
 CPU_MASK=$(printf '%x' $(( (1 << NUM_CPUS) - 1 )))
+
+# Grow rings where the driver allows it (drops -> throughput under burst)
+ethtool -G "${VPS_INTERFACE}" rx 4096 tx 4096 2>/dev/null || true
+ethtool -C "${VPS_INTERFACE}" adaptive-rx on 2>/dev/null || true
 
 # Enable all hardware offloads on the NIC
 ethtool -K "${VPS_INTERFACE}" gro on gso on tso on rx-gro-list off 2>/dev/null || true
@@ -112,7 +135,15 @@ echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
 for rxq in /sys/class/net/${VPS_INTERFACE}/queues/rx-*/rps_flow_cnt; do
     echo $((32768 / $(ls -d /sys/class/net/${VPS_INTERFACE}/queues/rx-* | wc -l) )) > "$rxq" 2>/dev/null || true
 done
-log "RPS/RFS configured: distributing softirq across ${NUM_CPUS} cores (mask 0x${CPU_MASK})"
+
+# XPS: map TX queues to cores (TX was single-core before; RPS alone only fixes RX)
+TXQ_IDX=0
+for txq in /sys/class/net/${VPS_INTERFACE}/queues/tx-*/xps_cpus; do
+    TX_MASK=$(printf '%x' $(( 1 << (TXQ_IDX % NUM_CPUS) )))
+    echo "$TX_MASK" > "$txq" 2>/dev/null || true
+    TXQ_IDX=$((TXQ_IDX + 1))
+done
+log "RPS/RFS/XPS configured: distributing softirq across ${NUM_CPUS} cores (mask 0x${CPU_MASK})"
 
 ###############################################################################
 # 3. Install shadowsocks-rust
@@ -192,7 +223,7 @@ cat > /etc/shadowsocks-rust/config.json << EOF
     "method": "${SS_METHOD}",
     "mptcp": true,
     "no_delay": true,
-    "tcp_keep_alive": 15,
+    "tcp_keep_alive": 30,
     "mode": "tcp_and_udp"
 }
 EOF
@@ -207,6 +238,16 @@ banner "Step 5/6 — NAT & Firewall"
 iptables -t nat -C POSTROUTING -o "${VPS_INTERFACE}" -j MASQUERADE 2>/dev/null \
     || iptables -t nat -A POSTROUTING -o "${VPS_INTERFACE}" -j MASQUERADE
 iptables -P FORWARD ACCEPT
+
+# MSS clamp: MPTCP+SS overhead (~60B) fragments full-size segments without this
+iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+    || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+# Skip conntrack for the tunnel port itself (less CPU per tunneled packet)
+iptables -t raw -C PREROUTING -p tcp --dport "${SS_PORT}" -j NOTRACK 2>/dev/null \
+    || iptables -t raw -A PREROUTING -p tcp --dport "${SS_PORT}" -j NOTRACK 2>/dev/null || true
+iptables -t raw -C OUTPUT -p tcp --sport "${SS_PORT}" -j NOTRACK 2>/dev/null \
+    || iptables -t raw -A OUTPUT -p tcp --sport "${SS_PORT}" -j NOTRACK 2>/dev/null || true
 
 if command -v netfilter-persistent &>/dev/null; then
     netfilter-persistent save > /dev/null 2>&1
@@ -247,6 +288,8 @@ ExecStart=/usr/local/bin/ssserver -c /etc/shadowsocks-rust/config.json
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
+CPUAffinity=0-3
+Nice=-5
 
 [Install]
 WantedBy=multi-user.target

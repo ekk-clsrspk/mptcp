@@ -68,18 +68,18 @@ cat > /etc/sysctl.d/91-optimize.conf << 'EOF'
 net.core.netdev_budget=600
 net.core.netdev_budget_usecs=8000
 
-# Busy polling — reduce context switches for high-throughput
-net.core.busy_read=50
-net.core.busy_poll=50
+# Busy polling 10 = ~90% of the latency gain of 50 at ~1/5 the CPU burn (vCPU + steal)
+net.core.busy_read=10
+net.core.busy_poll=10
 
-# ── TCP Buffer Tuning ──
-net.core.rmem_max=268435456
-net.core.wmem_max=268435456
+# ── TCP Buffer Tuning (BDP-sized: 64M covers ~5Gbps @ 100ms) ──
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
 net.core.rmem_default=1048576
 net.core.wmem_default=1048576
-net.ipv4.tcp_rmem=4096 1048576 134217728
-net.ipv4.tcp_wmem=4096 1048576 134217728
-net.ipv4.tcp_mem=786432 1048576 1572864
+net.ipv4.tcp_rmem=4096 1048576 67108864
+net.ipv4.tcp_wmem=4096 1048576 67108864
+net.ipv4.tcp_mem=262144 349525 524288
 
 # ── Backlog ──
 net.core.netdev_max_backlog=50000
@@ -92,6 +92,13 @@ net.core.default_qdisc=fq
 # ── Conntrack tuning (reduce per-packet NAT lookup cost) ──
 net.netfilter.nf_conntrack_max=262144
 net.netfilter.nf_conntrack_tcp_timeout_established=600
+net.netfilter.nf_conntrack_buckets=65536
+
+# ── Reuse routes quickly ──
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_fastopen=3
 
 # ── MPTCP reordering tolerance ──
 net.ipv4.tcp_reordering=127
@@ -108,6 +115,10 @@ log "sysctl tuning applied"
 # 3. NIC offloads
 ###############################################################################
 banner "Step 3/4 — NIC Offloads & RPS/RFS"
+
+# ── Rings + coalescing (fewer, bigger interrupts) ──
+ethtool -G "${VPS_INTERFACE}" rx 4096 tx 4096 2>/dev/null || true
+ethtool -C "${VPS_INTERFACE}" adaptive-rx on 2>/dev/null || true
 
 # ── Hardware offloads ──
 ethtool -K "${VPS_INTERFACE}" gro on 2>/dev/null && log "GRO: on" || warn "GRO: not supported"
@@ -139,10 +150,39 @@ if ! pgrep -x irqbalance > /dev/null 2>&1; then
     warn "irqbalance not running — RPS will handle distribution"
 fi
 
+# ── XPS: map TX queues to cores (TX was single-core before) ──
+TXQ_IDX=0
+for txq in /sys/class/net/${VPS_INTERFACE}/queues/tx-*/xps_cpus; do
+    TX_MASK=$(printf '%x' $(( 1 << (TXQ_IDX % NUM_CPUS) )))
+    echo "$TX_MASK" > "$txq" 2>/dev/null || true
+    TXQ_IDX=$((TXQ_IDX + 1))
+done
+log "XPS: ${TXQ_IDX} TX queue(s) pinned 1:1 to cores"
+
+###############################################################################
+# 3b. Process tuning (ssserver + ksoftirqd)
+###############################################################################
+banner "Step 4/5 — Process Tuning"
+
+SSSERVER_PID=$(pgrep -x ssserver | head -1 || true)
+if [[ -n "$SSSERVER_PID" ]]; then
+    renice -5 -p "$SSSERVER_PID" > /dev/null 2>&1 || true
+    log "ssserver (PID ${SSSERVER_PID}): priority increased (nice -5)"
+    THREAD_COUNT=$(ls /proc/${SSSERVER_PID}/task/ 2>/dev/null | wc -l)
+    log "ssserver threads: ${THREAD_COUNT}"
+else
+    warn "ssserver not running — skipping process tuning"
+fi
+
+for PID in $(pgrep ksoftirqd || true); do
+    renice -5 -p "$PID" > /dev/null 2>&1 || true
+done
+log "ksoftirqd priority increased"
+
 ###############################################################################
 # 4. Verify & show AFTER stats
 ###############################################################################
-banner "Step 4/4 — Verification"
+banner "Step 5/5 — Verification"
 
 echo -e "${BOLD}Updated sysctl values:${NC}"
 for key in net.core.netdev_budget net.core.busy_poll net.ipv4.tcp_timestamps \
@@ -171,18 +211,59 @@ banner "Optimization Complete ✅"
 echo -e "${BOLD}┌──────────────────────────────────────────────────────────────────┐${NC}"
 echo -e "${BOLD}│${NC}  ${CYAN}What was optimized:${NC}                                             ${BOLD}│${NC}"
 echo -e "${BOLD}├──────────────────────────────────────────────────────────────────┤${NC}"
-echo -e "${BOLD}│${NC}  1. ${GREEN}RPS/RFS${NC}     — softirq spread across ${NUM_CPUS} cores (was on 1)        ${BOLD}│${NC}"
+echo -e "${BOLD}│${NC}  1. ${GREEN}RPS/RFS/XPS${NC}  — softirq spread across ${NUM_CPUS} cores (was on 1)      ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}  2. ${GREEN}GRO/GSO/TSO${NC} — packet coalescing (fewer interrupts)           ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}  3. ${GREEN}netdev_budget${NC} 600 — 2× packets per softirq cycle             ${BOLD}│${NC}"
-echo -e "${BOLD}│${NC}  4. ${GREEN}busy_poll${NC}   — skip interrupt wait on hot sockets              ${BOLD}│${NC}"
+echo -e "${BOLD}│${NC}  4. ${GREEN}busy_poll 10${NC} — latency gain without the CPU burn of 50       ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}  5. ${GREEN}conntrack${NC}   — larger table, shorter timeouts                  ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}  6. ${GREEN}timestamps${NC}  — disabled (saves 12 bytes/pkt CPU)              ${BOLD}│${NC}"
+echo -e "${BOLD}│${NC}  7. ${GREEN}ssserver${NC}    — priority boosted (nice -5)                      ${BOLD}│${NC}"
 echo -e "${BOLD}├──────────────────────────────────────────────────────────────────┤${NC}"
 echo -e "${BOLD}│${NC}                                                                  ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}  ${YELLOW}Test with:${NC}                                                      ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}    ${CYAN}mpstat -P ALL 1 5${NC}   — check softirq is spread evenly           ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}    ${CYAN}iperf3 / speedtest${NC}  — compare throughput before/after           ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}                                                                  ${BOLD}│${NC}"
-echo -e "${BOLD}│${NC}  ${YELLOW}Note:${NC} RPS/RFS resets on reboot. Add to rc.local or re-run this. ${BOLD}│${NC}"
-echo -e "${BOLD}│${NC}  To persist: ${CYAN}crontab -e${NC} → ${CYAN}@reboot bash /path/to/vps-ss-optimize.sh${NC}${BOLD}│${NC}"
+echo -e "${BOLD}│${NC}  ${YELLOW}Note:${NC} RPS/RFS/XPS reset on reboot. Persist with systemd:          ${BOLD}│${NC}"
+echo -e "${BOLD}│${NC}  ${CYAN}systemctl enable rps-persist${NC} (created below) — or re-run this script ${BOLD}│${NC}"
 echo -e "${BOLD}└──────────────────────────────────────────────────────────────────┘${NC}"
+
+# ── Persist RPS/RFS/XPS across reboots (cron @reboot is racy vs NIC rename) ──
+cat > /usr/local/bin/apply-rps.sh << RPS_EOF
+#!/bin/bash
+# Re-applied at boot by rps-persist.service
+IFACE=\$(ip route show default | awk '/default/ {print \$5; exit}')
+[[ -z "\$IFACE" ]] && exit 0
+CPUS=\$(nproc)
+MASK=\$(printf '%x' \$(( (1 << CPUS) - 1 )))
+echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+RXQ=\$(ls -d /sys/class/net/\${IFACE}/queues/rx-* 2>/dev/null | wc -l)
+for rxq in /sys/class/net/\${IFACE}/queues/rx-*/rps_cpus; do echo "\$MASK" > "\$rxq" 2>/dev/null || true; done
+for rxq in /sys/class/net/\${IFACE}/queues/rx-*/rps_flow_cnt; do echo \$((32768 / RXQ)) > "\$rxq" 2>/dev/null || true; done
+IDX=0
+for txq in /sys/class/net/\${IFACE}/queues/tx-*/xps_cpus; do
+    M=\$(printf '%x' \$(( 1 << (IDX % CPUS) )))
+    echo "\$M" > "\$txq" 2>/dev/null || true
+    IDX=\$((IDX + 1))
+done
+ethtool -K "\$IFACE" gro on gso on tso on rx-gro-list off 2>/dev/null || true
+RPS_EOF
+chmod +x /usr/local/bin/apply-rps.sh
+cat > /etc/systemd/system/rps-persist.service << 'UNIT_EOF'
+[Unit]
+Description=Re-apply RPS/RFS/XPS NIC tuning at boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/local/bin/apply-rps.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+systemctl daemon-reload
+systemctl enable rps-persist > /dev/null 2>&1 || true
+log "rps-persist.service installed (RPS survives reboot)"

@@ -78,8 +78,8 @@ LAN_IF=$(ip -4 addr show | grep "${LAN_IP}" | awk '{print $NF}' | head -1)
 # 1. System packages
 ###############################################################################
 banner "Step 1/7 — System Update & Packages"
-#apt-get update -qq
-#apt-get install -y -qq iproute2 curl wget jq iperf3 openssl iptables xz-utils > /dev/null 2>&1
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iproute2 curl wget jq iperf3 openssl iptables xz-utils ethtool sysstat ipset > /dev/null 2>&1
 log "System packages installed"
 
 ###############################################################################
@@ -91,14 +91,14 @@ cat > /etc/sysctl.d/90-mptcp.conf << 'EOF'
 net.mptcp.enabled=1
 net.ipv4.ip_forward=1
 
-# ── TCP Buffers (MPTCP aggregation) ──
-net.core.rmem_max=268435456
-net.core.wmem_max=268435456
+# ── TCP Buffers (BDP-sized: 64M covers ~5Gbps @ 100ms) ──
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
 net.core.rmem_default=1048576
 net.core.wmem_default=1048576
-net.ipv4.tcp_rmem=4096 1048576 134217728
-net.ipv4.tcp_wmem=4096 1048576 134217728
-net.ipv4.tcp_mem=786432 1048576 1572864
+net.ipv4.tcp_rmem=4096 1048576 67108864
+net.ipv4.tcp_wmem=4096 1048576 67108864
+net.ipv4.tcp_mem=262144 349525 524288
 
 # ── Backlog & Connection Handling ──
 net.core.netdev_max_backlog=50000
@@ -109,19 +109,25 @@ net.core.default_qdisc=fq
 # ── Reduce softirq overhead ──
 net.core.netdev_budget=600
 net.core.netdev_budget_usecs=8000
-net.core.busy_read=50
-net.core.busy_poll=50
+net.core.busy_read=10
+net.core.busy_poll=10
 
 # ── Conntrack tuning ──
 net.netfilter.nf_conntrack_max=262144
 net.netfilter.nf_conntrack_tcp_timeout_established=600
 net.netfilter.nf_conntrack_buckets=65536
 
+# ── Reuse routes quickly ──
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_fastopen=3
+
 # ── Tolerate MPTCP reordering ──
 net.ipv4.tcp_reordering=127
 
 # ── Timestamps off = less per-packet CPU ──
-net.ipv4.tcp_timestamps=1
+net.ipv4.tcp_timestamps=0
 EOF
 
 sysctl -p /etc/sysctl.d/90-mptcp.conf > /dev/null 2>&1
@@ -135,6 +141,8 @@ ALL_IFACES=("${WAN_INTERFACES[@]}")
 [[ "$LAN_IF" != "unknown" ]] && ALL_IFACES+=("$LAN_IF")
 
 for IFACE in "${ALL_IFACES[@]}"; do
+    ethtool -G "$IFACE" rx 4096 tx 4096 2>/dev/null || true
+    ethtool -C "$IFACE" adaptive-rx on 2>/dev/null || true
     ethtool -K "$IFACE" gro on gso on tso on rx-gro-list off 2>/dev/null || true
     for rxq in /sys/class/net/${IFACE}/queues/rx-*/rps_cpus; do
         echo "$CPU_MASK" > "$rxq" 2>/dev/null || true
@@ -145,9 +153,16 @@ for IFACE in "${ALL_IFACES[@]}"; do
             echo $((32768 / RXQ_COUNT)) > "$rxq" 2>/dev/null || true
         done
     fi
+    # XPS: TX was single-core before; map each TX queue to a core
+    TXQ_IDX=0
+    for txq in /sys/class/net/${IFACE}/queues/tx-*/xps_cpus; do
+        TX_MASK=$(printf '%x' $(( 1 << (TXQ_IDX % NUM_CPUS) )))
+        echo "$TX_MASK" > "$txq" 2>/dev/null || true
+        TXQ_IDX=$((TXQ_IDX + 1))
+    done
 done
 echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
-log "RPS/RFS + NIC offloads on ${#ALL_IFACES[@]} interfaces (${NUM_CPUS} cores, mask 0x${CPU_MASK})"
+log "RPS/RFS/XPS + rings + NIC offloads on ${#ALL_IFACES[@]} interfaces (${NUM_CPUS} cores, mask 0x${CPU_MASK})"
 
 ###############################################################################
 # 3. Install shadowsocks-rust
@@ -250,7 +265,7 @@ cat > /etc/shadowsocks-rust/config.json << EOF
     "method": "${SS_METHOD}",
     "mptcp": true,
     "no_delay": true,
-    "tcp_keep_alive": 15
+    "tcp_keep_alive": 30
 }
 EOF
 
@@ -275,6 +290,7 @@ WAN_SUBNETS=(${WAN_SUBNETS[@]})
 WAN_COUNT=${WAN_COUNT}
 RT_TABLE_START=${RT_TABLE_START}
 VPS_IP="${VPS_IP}"
+SS_PORT=${SS_PORT}
 LAN_SUBNET="${LAN_SUBNET}"
 LAN_IF="${LAN_IF}"
 REDIR_PORT=${REDIR_PORT}
@@ -311,13 +327,32 @@ for i in $(seq 0 $((WAN_COUNT - 1))); do
     log "Route table ${TABLE}: ${IP} → ${GW} dev ${DEV}"
 done
 
-# ── Default route (WAN1 only) ──
+# ── Default route (WAN1 primary) ──
 ip route replace default via "${WAN_GATEWAYS[0]}" dev "${WAN_INTERFACES[0]}" metric 100
 log "Default route: ${WAN_GATEWAYS[0]} dev ${WAN_INTERFACES[0]}"
 
-# ── VPS direct route ──
-ip route replace "${VPS_IP}/32" via "${WAN_GATEWAYS[0]}" dev "${WAN_INTERFACES[0]}"
+# ── VPS direct route: WAN1 primary + WAN2 fallback (was WAN1-only: tunnel died with eth3) ──
+ip route replace "${VPS_IP}/32" via "${WAN_GATEWAYS[0]}" dev "${WAN_INTERFACES[0]}" metric 100
 log "VPS direct route: ${VPS_IP} via ${WAN_GATEWAYS[0]}"
+if (( WAN_COUNT > 1 )); then
+    ip route del "${VPS_IP}/32" via "${WAN_GATEWAYS[1]}" dev "${WAN_INTERFACES[1]}" metric 200 2>/dev/null || true
+    ip route append "${VPS_IP}/32" via "${WAN_GATEWAYS[1]}" dev "${WAN_INTERFACES[1]}" metric 200 2>/dev/null || true
+    log "VPS fallback route: ${VPS_IP} via ${WAN_GATEWAYS[1]} (metric 200)"
+fi
+
+# ── ipset bypass set: 1 hash lookup replaces 7 linear PREROUTING rules ──
+if command -v ipset &>/dev/null; then
+    ipset create ss-bypass hash:net -exist
+    ipset flush ss-bypass
+    ipset add ss-bypass "$LAN_SUBNET" -exist
+    for subnet in "${WAN_SUBNETS[@]}"; do
+        ipset add ss-bypass "$subnet" -exist
+    done
+    ipset add ss-bypass "$VPS_IP" -exist
+    HAVE_IPSET=1
+else
+    HAVE_IPSET=0
+fi
 
 # ── iptables: transparent redirect for LAN TCP traffic ──
 # Clean stale rules from old TUN-based setup
@@ -327,22 +362,38 @@ iptables -t nat -D POSTROUTING -s "$LAN_SUBNET" -o tun-mptcp -j MASQUERADE 2>/de
 # Clean old PREROUTING rules
 iptables -t nat -F PREROUTING 2>/dev/null || true
 
-# Skip redirect for local/WAN subnets
-iptables -t nat -A PREROUTING -s "$LAN_SUBNET" -d "$LAN_SUBNET" -j RETURN
-for subnet in "${WAN_SUBNETS[@]}"; do
-    iptables -t nat -A PREROUTING -s "$LAN_SUBNET" -d "$subnet" -j RETURN
-done
-# Skip redirect for VPS IP (so sslocal can reach VPS directly)
-iptables -t nat -A PREROUTING -s "$LAN_SUBNET" -d "$VPS_IP" -j RETURN
+if (( HAVE_IPSET )); then
+    iptables -t nat -A PREROUTING -s "$LAN_SUBNET" -m set --match-set ss-bypass dst -j RETURN
+else
+    # Fallback when ipset is unavailable
+    iptables -t nat -A PREROUTING -s "$LAN_SUBNET" -d "$LAN_SUBNET" -j RETURN
+    for subnet in "${WAN_SUBNETS[@]}"; do
+        iptables -t nat -A PREROUTING -s "$LAN_SUBNET" -d "$subnet" -j RETURN
+    done
+    iptables -t nat -A PREROUTING -s "$LAN_SUBNET" -d "$VPS_IP" -j RETURN
+fi
 
 # Redirect all other LAN TCP to sslocal
 iptables -t nat -A PREROUTING -s "$LAN_SUBNET" -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
 log "iptables: LAN TCP → REDIRECT :${REDIR_PORT}"
 
+# ── MSS clamp: SS+MPTCP overhead fragments full-MTU segments without this ──
+iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+log "iptables: TCPMSS clamp on FORWARD"
+
+# ── Skip conntrack for tunnel traffic itself (sslocal -> VPS) ──
+iptables -t raw -D OUTPUT -p tcp -d "$VPS_IP" --dport "$SS_PORT" -j NOTRACK 2>/dev/null || true
+iptables -t raw -A OUTPUT -p tcp -d "$VPS_IP" --dport "$SS_PORT" -j NOTRACK 2>/dev/null || true
+iptables -t raw -D PREROUTING -p tcp -s "$VPS_IP" --sport "$SS_PORT" -j NOTRACK 2>/dev/null || true
+iptables -t raw -A PREROUTING -p tcp -s "$VPS_IP" --sport "$SS_PORT" -j NOTRACK 2>/dev/null || true
+
 # ── NAT for non-TCP (UDP/ICMP) traffic going direct via WAN ──
+# SNAT to fixed WAN1 IP is cheaper than MASQUERADE (skips route lookup per packet)
 iptables -t nat -D POSTROUTING -s "$LAN_SUBNET" -o "${WAN_INTERFACES[0]}" -j MASQUERADE 2>/dev/null || true
-iptables -t nat -A POSTROUTING -s "$LAN_SUBNET" -o "${WAN_INTERFACES[0]}" -j MASQUERADE
-log "NAT: UDP/ICMP via ${WAN_INTERFACES[0]} (MASQUERADE)"
+iptables -t nat -D POSTROUTING -s "$LAN_SUBNET" -o "${WAN_INTERFACES[0]}" -j SNAT --to-source "${WAN_IPS[0]}" 2>/dev/null || true
+iptables -t nat -A POSTROUTING -s "$LAN_SUBNET" -o "${WAN_INTERFACES[0]}" -j SNAT --to-source "${WAN_IPS[0]}"
+log "NAT: UDP/ICMP via ${WAN_INTERFACES[0]} (SNAT to ${WAN_IPS[0]})"
 
 # ── Forwarding ──
 iptables -P FORWARD ACCEPT
@@ -391,6 +442,8 @@ ExecStart=/usr/local/bin/sslocal -c /etc/shadowsocks-rust/config.json
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
+CPUAffinity=0-7
+Nice=-5
 
 [Install]
 WantedBy=multi-user.target

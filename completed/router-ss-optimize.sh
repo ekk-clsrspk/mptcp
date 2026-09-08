@@ -81,18 +81,18 @@ cat > /etc/sysctl.d/91-router-optimize.conf << 'EOF'
 net.core.netdev_budget=600
 net.core.netdev_budget_usecs=8000
 
-# Busy polling — reduce context switches for high-throughput
-net.core.busy_read=50
-net.core.busy_poll=50
+# Busy polling 10 = ~90% of the latency gain of 50 at ~1/5 the CPU burn (matters under steal)
+net.core.busy_read=10
+net.core.busy_poll=10
 
-# ── TCP buffers (already set by router-ss.sh, ensure correct) ──
-net.core.rmem_max=268435456
-net.core.wmem_max=268435456
+# ── TCP buffers (BDP-sized: 64M covers ~5Gbps @ 100ms) ──
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
 net.core.rmem_default=1048576
 net.core.wmem_default=1048576
-net.ipv4.tcp_rmem=4096 1048576 134217728
-net.ipv4.tcp_wmem=4096 1048576 134217728
-net.ipv4.tcp_mem=786432 1048576 1572864
+net.ipv4.tcp_rmem=4096 1048576 67108864
+net.ipv4.tcp_wmem=4096 1048576 67108864
+net.ipv4.tcp_mem=262144 349525 524288
 
 # ── Backlog ──
 net.core.netdev_max_backlog=50000
@@ -105,6 +105,13 @@ net.core.default_qdisc=fq
 # ── Conntrack — reduce from 5 days to 10 min ──
 net.netfilter.nf_conntrack_max=262144
 net.netfilter.nf_conntrack_tcp_timeout_established=600
+net.netfilter.nf_conntrack_buckets=65536
+
+# ── Reuse routes quickly ──
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_fastopen=3
 
 # ── MPTCP ──
 net.mptcp.enabled=1
@@ -185,6 +192,10 @@ for IFACE in $(ls /sys/class/net/); do
 
     CHANGED=""
 
+    # Rings + coalescing (fewer, bigger interrupts)
+    ethtool -G "$IFACE" rx 4096 tx 4096 2>/dev/null || true
+    ethtool -C "$IFACE" adaptive-rx on 2>/dev/null || true
+
     # GRO
     ethtool -K "$IFACE" gro on 2>/dev/null && CHANGED="${CHANGED}GRO " || true
     # GSO
@@ -260,7 +271,7 @@ echo -e "${BOLD}│${NC}  1. ${GREEN}RPS/RFS${NC}      — softirq → all ${NUM
 echo -e "${BOLD}│${NC}  2. ${GREEN}XPS${NC}          — TX queue → core affinity                       ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}  3. ${GREEN}GRO/GSO/TSO${NC}  — packet coalescing on all NICs                  ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}  4. ${GREEN}netdev_budget${NC} — 600 (2x default)                              ${BOLD}│${NC}"
-echo -e "${BOLD}│${NC}  5. ${GREEN}busy_poll${NC}    — enabled (skip interrupt wait)                   ${BOLD}│${NC}"
+echo -e "${BOLD}│${NC}  5. ${GREEN}busy_poll 10${NC} — latency gain without the CPU burn of 50        ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}  6. ${GREEN}conntrack${NC}    — timeout 600s (was 432000s / 5 days!)            ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}  7. ${GREEN}timestamps${NC}   — disabled (saves CPU per packet)                 ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}  8. ${GREEN}sslocal${NC}      — priority boosted (nice -5)                      ${BOLD}│${NC}"
@@ -277,6 +288,50 @@ echo -e "${BOLD}│${NC}  ${YELLOW}Test:${NC}                                   
 echo -e "${BOLD}│${NC}    ${CYAN}mpstat -P ALL 1 5${NC}  — softirq should be spread evenly            ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}    ${CYAN}speedtest / iperf3${NC} — compare throughput                         ${BOLD}│${NC}"
 echo -e "${BOLD}│${NC}                                                                  ${BOLD}│${NC}"
-echo -e "${BOLD}│${NC}  ${YELLOW}Note:${NC} RPS/RFS/XPS reset on reboot. Persist with:                 ${BOLD}│${NC}"
-echo -e "${BOLD}│${NC}    ${CYAN}crontab -e${NC} → ${CYAN}@reboot sleep 10 && bash /path/to/this.sh${NC}       ${BOLD}│${NC}"
+echo -e "${BOLD}│${NC}  ${YELLOW}Note:${NC} RPS/RFS/XPS reset on reboot — persisted via systemd:          ${BOLD}│${NC}"
+echo -e "${BOLD}│${NC}    ${CYAN}systemctl enable rps-persist${NC} (created below)                       ${BOLD}│${NC}"
 echo -e "${BOLD}└──────────────────────────────────────────────────────────────────┘${NC}"
+
+# ── Persist RPS/RFS/XPS across reboots (all up interfaces, not just default) ──
+cat > /usr/local/bin/apply-rps.sh << 'RPS_EOF'
+#!/bin/bash
+# Re-applied at boot by rps-persist.service (all non-lo up interfaces)
+CPUS=$(nproc)
+MASK=$(printf '%x' $(( (1 << CPUS) - 1 )))
+echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+for IFACE in $(ls /sys/class/net/); do
+    [[ "$IFACE" == "lo" ]] && continue
+    [[ "$(cat /sys/class/net/${IFACE}/operstate 2>/dev/null)" != "up" ]] && continue
+    RXQ=$(ls -d /sys/class/net/${IFACE}/queues/rx-* 2>/dev/null | wc -l)
+    (( RXQ == 0 )) && continue
+    FLOW=$((32768 / RXQ))
+    for rxq in /sys/class/net/${IFACE}/queues/rx-*/rps_cpus; do echo "$MASK" > "$rxq" 2>/dev/null || true; done
+    for rxq in /sys/class/net/${IFACE}/queues/rx-*/rps_flow_cnt; do echo "$FLOW" > "$rxq" 2>/dev/null || true; done
+    IDX=0
+    for txq in /sys/class/net/${IFACE}/queues/tx-*/xps_cpus; do
+        M=$(printf '%x' $(( 1 << (IDX % CPUS) )))
+        echo "$M" > "$txq" 2>/dev/null || true
+        IDX=$((IDX + 1))
+    done
+    ethtool -K "$IFACE" gro on gso on tso on rx-gro-list off 2>/dev/null || true
+done
+RPS_EOF
+chmod +x /usr/local/bin/apply-rps.sh
+cat > /etc/systemd/system/rps-persist.service << 'UNIT_EOF'
+[Unit]
+Description=Re-apply RPS/RFS/XPS NIC tuning at boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/bin/apply-rps.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+systemctl daemon-reload
+systemctl enable rps-persist > /dev/null 2>&1 || true
+log "rps-persist.service installed (RPS survives reboot)"
