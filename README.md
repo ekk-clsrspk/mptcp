@@ -82,6 +82,32 @@ sudo bash router-ss-optimize.sh   # on the router
 
 That's it. The scripts enable everything at boot, so a reboot just works.
 
+## What the scripts put on your machines
+
+You only ever run the 4 scripts above. They create everything else
+automatically — here's what those extra names in the troubleshooting
+section refer to:
+
+**On the router**, `router-ss.sh` generates a helper from your config:
+
+- `/usr/local/bin/mptcp-setup.sh` — applies the bonding + routing +
+  firewall rules. Re-running it by hand is the "turn it off and on again"
+  for this setup: it never hurts, and it's the first thing to try when
+  something looks stuck.
+
+And registers background services (managed with `systemctl`, start at boot):
+
+| Service | Machine | Job |
+|---|---|---|
+| `sslocal-mptcp` | Router | The tunnel client — your traffic's front door |
+| `mptcp-routing` | Router | Runs `mptcp-setup.sh` at boot so routing survives restarts |
+| `ssserver-mptcp` | VPS | The tunnel server — reassembles your traffic |
+| `rps-persist` | Both | Re-applies the speed tuning at boot (created by the optimize scripts) |
+
+Settings live in `/etc/shadowsocks-rust/config.json` (tunnel password etc.)
+and `/etc/sysctl.d/90-mptcp.conf` + `91-*.conf` (speed tuning). You normally
+never need to touch these — re-running the scripts rewrites them.
+
 ## How to check it's working
 
 From any device on your home network:
@@ -101,6 +127,17 @@ mpstat -P ALL 1 5  # work should be spread evenly over all CPU cores
 ```
 
 Then run any speed test and compare against a single line.
+
+## Proof it works
+
+Real result from a 5-line home setup through this tunnel — Ookla Speedtest
+on a home PC, with per-line traffic (`eth0/eth1/eth2…`) visible on the
+dashboard underneath:
+
+![Speedtest through the bonded tunnel: 6 ms ping, 5304.98 Mbps down, 2926.46 Mbps up](IMG_3342.JPG)
+
+**6 ms ping, 5.3 Gbps down, 2.9 Gbps up** — no single home line here could do
+that alone. Your numbers will match roughly the sum of *your* lines.
 
 ## If something's wrong
 
@@ -138,3 +175,4 @@ Re-enable with `sudo /usr/local/bin/mptcp-setup.sh`.
 | `router-ss.sh` | Router | Installs the client, sets up bonding + routing |
 | `vps-ss-optimize.sh` | VPS | Speed tuning (safe to re-run) |
 | `router-ss-optimize.sh` | Router | Speed tuning (safe to re-run) |
+| `IMG_3342.JPG` | — | Speedtest screenshot used above |
