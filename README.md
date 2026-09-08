@@ -134,7 +134,7 @@ Real result from a home with **4 ISPs bonded** through this tunnel — Ookla
 Speedtest on a home PC, with per-line traffic (`eth0/eth1/eth2…`) visible on
 the dashboard underneath:
 
-![Speedtest through the bonded tunnel: 6 ms ping, 5304.98 Mbps down, 2926.46 Mbps up](IMG_3342.JPG)
+![Speedtest through the bonded tunnel: 6 ms ping, 5304.98 Mbps down, 2926.46 Mbps up](proof.jpg)
 
 The 4 lines going in:
 
@@ -187,4 +187,3 @@ Re-enable with `sudo /usr/local/bin/mptcp-setup.sh`.
 | `router-ss.sh` | Router | Installs the client, sets up bonding + routing |
 | `vps-ss-optimize.sh` | VPS | Speed tuning (safe to re-run) |
 | `router-ss-optimize.sh` | Router | Speed tuning (safe to re-run) |
-| `IMG_3342.JPG` | — | Speedtest screenshot used above |
