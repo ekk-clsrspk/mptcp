@@ -18,25 +18,32 @@
 
 set -euo pipefail
 
-# ─────────────────────────── Configuration ──────────────────────────────────
+# ─────────────────── Configuration (EDIT THESE BEFORE RUNNING) ────────────
+#
+#  Example for 2 WANs (extend the lists for more):
+#    WAN_INTERFACES=("eth0" "eth1")
+#    WAN_IPS=(   "192.168.1.4"   "192.168.2.4"   )
+#    WAN_GATEWAYS=("192.168.1.1" "192.168.2.1"   )
+#    WAN_SUBNETS=("192.168.1.0/24" "192.168.2.0/24")
 
-# VPS details
-VPS_IP="103.52.108.174"
+# VPS details — your VPS public IP (the server vps-ss.sh runs on)
+VPS_IP="YOUR_VPS_IP"
 SS_PORT=8389
 SS_METHOD="2022-blake3-aes-128-gcm"
 
-WAN_INTERFACES=("eth3" "eth6" "eth4" "eth5" "eth7")
-WAN_IPS=("192.168.1.4" "192.168.170.4" "192.168.150.4" "192.168.160.4" "192.168.180.4")
-WAN_GATEWAYS=("192.168.1.1" "192.168.170.1" "192.168.150.1" "192.168.160.1" "192.168.180.1")
-WAN_SUBNETS=("192.168.1.0/24" "192.168.170.0/24" "192.168.150.0/24" "192.168.160.0/24" "192.168.180.0/24")
+# One entry per internet line, all lists in the SAME order (WAN1, WAN2, ...)
+WAN_INTERFACES=("WAN1_IF" "WAN2_IF" "WAN3_IF" "WAN4_IF" "WAN5_IF")
+WAN_IPS=("WAN1_IP" "WAN2_IP" "WAN3_IP" "WAN4_IP" "WAN5_IP")
+WAN_GATEWAYS=("WAN1_GW" "WAN2_GW" "WAN3_GW" "WAN4_GW" "WAN5_GW")
+WAN_SUBNETS=("WAN1_NET" "WAN2_NET" "WAN3_NET" "WAN4_NET" "WAN5_NET")
 
 # Routing table IDs
 RT_TABLE_START=101
 RT_TABLE_TUNNEL=200
 
-# LAN
-LAN_SUBNET="10.100.0.0/24"
-LAN_IP="10.100.0.1"
+# LAN — change only if your home network uses different addresses
+LAN_SUBNET="YOUR_LAN_SUBNET"   # e.g. "192.168.10.0/24"
+LAN_IP="YOUR_LAN_IP"           # e.g. "192.168.10.1" (this router's LAN address)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -56,6 +63,12 @@ if [[ $# -lt 1 || -z "${1:-}" ]]; then
     exit 1
 fi
 SS_PASSWORD="$1"
+
+if [[ "$VPS_IP" == "YOUR_VPS_IP" || "${WAN_IPS[0]:-}" == "WAN1_IP" || "$LAN_SUBNET" == "YOUR_LAN_SUBNET" ]]; then
+    err "Edit the Configuration block at the top of this script first:"
+    err "  VPS_IP, WAN_INTERFACES / WAN_IPS / WAN_GATEWAYS / WAN_SUBNETS, LAN_SUBNET / LAN_IP"
+    exit 1
+fi
 
 if [[ $EUID -ne 0 ]]; then err "Run as root"; exit 1; fi
 
